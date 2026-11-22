@@ -156,7 +156,8 @@
       {% else %}<span class="badge warn">仅评估</span>{% endif %}）
     </h3>
     <p class="muted">水位 timeline {{ d.last_check.primary_timeline }}，提交 LSN <code>{{ d.last_check.commit_lsn_text }}</code>
-       ，检查基于 v{{ d.last_check.incident_version }}{% if d.last_check.detail %}；{{ d.last_check.detail }}{% endif %}</p>
+       ，检查基于 v{{ d.last_check.incident_version }}{% if d.last_check.detail %}；{{ d.last_check.detail }}{% endif %}
+       <br>同一事件、同一版本、同一有效 timeline 与提交 LSN 的检查/确认共用一份逐副本结论，重复执行不会重算。</p>
     <table>
       <thead><tr><th>候选</th><th>timeline</th><th>replay LSN</th><th>结论</th><th>淘汰原因 / 所需 WAL</th></tr></thead>
       <tbody>

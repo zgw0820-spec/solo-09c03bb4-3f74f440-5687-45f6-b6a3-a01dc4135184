@@ -9,14 +9,21 @@ All concurrency rules live here:
 * ``request_id`` / ``client_request_id`` make takeover confirmations, checks
   and late recovery reports idempotent: a replayed request returns the result
   that already took effect, never a second mutation.
-* Every accepted evaluation is persisted as a ``CheckRun`` with per-candidate
-  verdicts, so rejection reasons remain auditable.
+* Every accepted evaluation is persisted, so rejection reasons remain
+  auditable.  The per-replica verdicts are stored once per evaluation *basis*
+  (incident, incident version, effective timeline and numeric commit LSN) in
+  ``CheckEvaluation``; a check followed by a takeover confirmation — or any
+  retry/replay at the same basis — reads that single stored conclusion instead
+  of recomputing and duplicating it.  Each request still gets its own
+  ``CheckRun`` row with its own check id and processing outcome.
 """
 from __future__ import annotations
 
 import json
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -25,7 +32,9 @@ from .config import settings
 from .models import (
     ArchiveSegment,
     CheckCandidate,
+    CheckEvaluation,
     CheckRun,
+    CheckVerdict,
     FailoverGeneration,
     IdempotencyRecord,
     Incident,
@@ -71,13 +80,20 @@ class ValidationFailed(ServiceError):
 # helpers
 # --------------------------------------------------------------------------- #
 def _lock_incident(session: Session, incident_id: int) -> Incident:
-    incident = session.get(Incident, incident_id)
+    if settings.schema_lock_mode == "postgresql":
+        # Lock first so concurrent writes to the same incident serialize.  A
+        # second waiter must re-read the row after the lock is granted instead
+        # of keeping the version it saw before blocking.
+        incident = session.scalars(
+            select(Incident)
+            .where(Incident.id == incident_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+    else:
+        incident = session.get(Incident, incident_id)
     if incident is None:
         raise NotFound(f"incident {incident_id} not found")
-    if settings.schema_lock_mode == "postgresql":
-        session.execute(
-            select(Incident).where(Incident.id == incident_id).with_for_update()
-        )
     return incident
 
 
@@ -182,35 +198,105 @@ def _watermark(
     return timeline, commit_lsn, commit_text
 
 
-def _persist_check(
+def _evaluation_query(incident_id: int, version: int, timeline: int, commit_lsn: int):
+    """Select the shared evaluation for one exact basis.
+
+    The basis is the incident, the incident version (which changes whenever the
+    inputs — observations or archives — change), the effective timeline and the
+    numeric commit LSN.  The literal text the operator typed is not part of the
+    basis: ``0/03000100`` and ``0/3000100`` are the same watermark.
+    """
+    return select(CheckEvaluation).where(
+        CheckEvaluation.incident_id == incident_id,
+        CheckEvaluation.incident_version == version,
+        CheckEvaluation.primary_timeline == timeline,
+        CheckEvaluation.commit_lsn == commit_lsn,
+    )
+
+
+def _insert_evaluation_if_absent(
+    session: Session, incident: Incident, timeline: int, commit_lsn: int
+) -> int | None:
+    """Atomically claim the evaluation basis; return the new row id on a win.
+
+    ``ON CONFLICT DO NOTHING ... RETURNING id`` turns the unique basis
+    constraint into the arbiter for concurrent requests: exactly one caller
+    inserts the row and gets an id back, every other caller either waits for
+    that insert to commit or sees it already present and then reads the same
+    conclusion.  The loser gets ``None`` instead of an IntegrityError, so its
+    request transaction stays clean.
+    """
+    values = {
+        "incident_id": incident.id,
+        "incident_version": incident.version,
+        "primary_timeline": timeline,
+        "commit_lsn": commit_lsn,
+        "commit_lsn_text": lsn_mod.format_lsn(commit_lsn),
+    }
+    if session.get_bind().dialect.name == "postgresql":
+        stmt = pg_insert(CheckEvaluation).values(**values).on_conflict_do_nothing(
+            constraint="uq_check_evaluation_basis"
+        )
+    else:
+        stmt = sqlite_insert(CheckEvaluation).values(**values).on_conflict_do_nothing(
+            index_elements=[
+                "incident_id",
+                "incident_version",
+                "primary_timeline",
+                "commit_lsn",
+            ]
+        )
+    return session.scalar(stmt.returning(CheckEvaluation.id))
+
+
+def _get_or_create_evaluation(
     session: Session,
     incident: Incident,
     timeline: int,
     commit_lsn: int,
-    commit_text: str,
-    decision: failover.FailoverDecision,
-    outcome: str,
-    request_id: str | None,
-    detail: str | None,
-) -> CheckRun:
-    check = CheckRun(
-        incident_id=incident.id,
-        incident_version=incident.version,
-        primary_timeline=timeline,
-        commit_lsn=commit_lsn,
-        commit_lsn_text=commit_text,
-        outcome=outcome,
-        request_id=request_id,
-        detail=detail,
+    *,
+    decision_factory,
+) -> CheckEvaluation:
+    """Return the single stored per-replica conclusion for this basis.
+
+    The rules are only evaluated when no conclusion exists yet; a repeated
+    check / confirmation at the same basis reuses the persisted verdicts (and
+    therefore survives process restarts).  ``decision_factory`` is only called
+    on a miss, so the evaluation is computed at most once per basis.
+    """
+    stmt = _evaluation_query(incident.id, incident.version, timeline, commit_lsn)
+    existing = session.scalars(stmt).first()
+    if existing is not None:
+        return existing
+
+    evaluation_id = _insert_evaluation_if_absent(
+        session, incident, timeline, commit_lsn
     )
-    session.add(check)
-    session.flush()
+    if evaluation_id is None:
+        # A concurrent request claimed the same basis first. Its verdicts may
+        # still be committing; the SELECT blocks on that row until it is
+        # visible, then returns the winner's conclusion.
+        existing = session.scalars(
+            stmt.execution_options(populate_existing=True)
+        ).first()
+        if existing is None:  # pragma: no cover - winner rolled back
+            raise Conflict(
+                "evaluation_conflict",
+                "同一评估依据的结论正在写入，请重试",
+            )
+        return existing
+
+    # We claimed the basis: store the verdicts inside this same transaction.
+    # A failure here rolls back both the evaluation and this request's check
+    # row, so no half-stored conclusion ever takes effect.
+    evaluation = session.get(CheckEvaluation, evaluation_id)
+    decision = decision_factory()
     node_by_id = {n.id: n for n in incident.nodes}
     for verdict in decision.verdicts:
         node = node_by_id[verdict.node_id]
         session.add(
-            CheckCandidate(
-                check_run_id=check.id,
+            CheckVerdict(
+                evaluation_id=evaluation.id,
                 node_id=node.id,
                 timeline=verdict.timeline,
                 replay_lsn=verdict.replay_lsn,
@@ -221,6 +307,33 @@ def _persist_check(
                 missing_segment=verdict.missing_segment,
             )
         )
+    session.flush()
+    return evaluation
+
+
+def _persist_check(
+    session: Session,
+    incident: Incident,
+    evaluation: CheckEvaluation,
+    commit_text: str,
+    outcome: str,
+    request_id: str | None,
+    detail: str | None,
+) -> CheckRun:
+    """Record this request's own processing result against the shared verdicts."""
+    check = CheckRun(
+        incident_id=incident.id,
+        incident_version=evaluation.incident_version,
+        primary_timeline=evaluation.primary_timeline,
+        commit_lsn=evaluation.commit_lsn,
+        commit_lsn_text=commit_text,
+        outcome=outcome,
+        request_id=request_id,
+        detail=detail,
+        evaluation_id=evaluation.id,
+    )
+    session.add(check)
+    session.flush()
     return check
 
 
@@ -380,14 +493,18 @@ def run_check(session: Session, incident_id: int, req: CheckRequest) -> dict:
     timeline, commit_lsn, commit_text = _watermark(
         incident, req.primary_timeline, req.commit_lsn
     )
-    decision = _evaluate_now(session, incident, timeline, commit_lsn)
-    check = _persist_check(
+    evaluation = _get_or_create_evaluation(
         session,
         incident,
         timeline,
         commit_lsn,
+        decision_factory=lambda: _evaluate_now(session, incident, timeline, commit_lsn),
+    )
+    check = _persist_check(
+        session,
+        incident,
+        evaluation,
         commit_text,
-        decision,
         outcome="evaluated",
         request_id=req.client_request_id,
         detail=None,
@@ -418,17 +535,21 @@ def promote(session: Session, incident_id: int, req: PromoteRequest) -> dict:
     timeline, commit_lsn, commit_text = _watermark(
         incident, req.primary_timeline, req.commit_lsn
     )
-    decision = _evaluate_now(session, incident, timeline, commit_lsn)
-    eligible = decision.eligible
+    evaluation = _get_or_create_evaluation(
+        session,
+        incident,
+        timeline,
+        commit_lsn,
+        decision_factory=lambda: _evaluate_now(session, incident, timeline, commit_lsn),
+    )
+    eligible = _eligible_verdicts(session, evaluation)
 
     if not eligible:
         check = _persist_check(
             session,
             incident,
-            timeline,
-            commit_lsn,
+            evaluation,
             commit_text,
-            decision,
             outcome="failed_kept_old_primary",
             request_id=req.request_id,
             detail="没有可接任副本，继续保留上次主库",
@@ -485,10 +606,8 @@ def promote(session: Session, incident_id: int, req: PromoteRequest) -> dict:
     check = _persist_check(
         session,
         incident,
-        timeline,
-        commit_lsn,
+        evaluation,
         commit_text,
-        decision,
         outcome="promoted",
         request_id=req.request_id,
         detail=f"第 {next_generation} 代主库：{new_primary.name}",
@@ -498,6 +617,17 @@ def promote(session: Session, incident_id: int, req: PromoteRequest) -> dict:
     payload = _promotion_payload(session, incident, generation, idempotent=False, check=check)
     _idem_store(session, incident_id, "promote", req.request_id, payload)
     return payload
+
+
+def _eligible_verdicts(session: Session, evaluation: CheckEvaluation) -> list[CheckVerdict]:
+    """Shared, already-persisted verdicts that allow takeover."""
+    rows = session.scalars(
+        select(CheckVerdict).where(
+            CheckVerdict.evaluation_id == evaluation.id,
+            CheckVerdict.eligible.is_(True),
+        )
+    ).all()
+    return list(rows)
 
 
 def recovery_report(session: Session, incident_id: int, report: RecoveryReport) -> dict:
@@ -586,9 +716,20 @@ def _observation_dict(obs: Observation) -> dict:
 
 
 def _check_payload(session: Session, check: CheckRun, idempotent: bool) -> dict:
-    candidates = session.scalars(
-        select(CheckCandidate).where(CheckCandidate.check_run_id == check.id)
-    ).all()
+    if check.evaluation_id is not None:
+        rows = session.scalars(
+            select(CheckVerdict)
+            .where(CheckVerdict.evaluation_id == check.evaluation_id)
+            .order_by(CheckVerdict.id)
+        ).all()
+    else:
+        # Legacy check run written before shared evaluations: its verdicts
+        # live on check_candidates and stay readable as-is.
+        rows = session.scalars(
+            select(CheckCandidate)
+            .where(CheckCandidate.check_run_id == check.id)
+            .order_by(CheckCandidate.id)
+        ).all()
     return {
         "idempotent_replay": idempotent,
         "check_id": check.id,
@@ -608,7 +749,7 @@ def _check_payload(session: Session, check: CheckRun, idempotent: bool) -> dict:
                 "required_segments": json.loads(c.required_segments_json),
                 "missing_segment": c.missing_segment,
             }
-            for c in candidates
+            for c in rows
         ],
     }
 

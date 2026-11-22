@@ -28,6 +28,9 @@ LSN 按 64 位整数处理（`hi/lo` 十六进制），segment 号 = `LSN / 16Mi
 | --- | --- |
 | 新观测与接任确认交错，页面已过期 | 每个事件带单调 `version`，表单提交 `expected_version`；不匹配返回 `409 stale_version`，过期页面**不能覆盖已确认的主库代次** |
 | 重复的接任确认 / 检查 / 恢复回报 | 幂等键（`request_id` / `client_request_id`）落在 `idempotency_records` 表；重放只返回**第一次已生效的结果**，且幂等检查先于版本检查，旧页面重放同样拿到原结果 |
+| 同一依据重复检查 / 检查后直接确认 | 逐副本结论按**评估依据**只存一份（`check_evaluations` + `check_verdicts`）：同一事件、同一事件版本、实际采用的 timeline 与提交 LSN **数值**相同即复用，不重算、不重复保存；每个请求仍各自留下自己的 `check_runs` 行（检查编号、结果、水位原文） |
+| 并发/重启后的复用 | 依据上有唯一约束，写入用 `ON CONFLICT DO NOTHING` 争用：并发请求最终都读到同一份已提交结论；结论在数据库中，进程重启后继续复用。落库失败时结论与本次处理记录同事务回滚，均不生效 |
+| 版本或水位变化 | `incident.version` 在观测/归档变更时递增，作为依据的一部分；版本或有效水位变了，新请求按新依据重新评估（补录归档后即属于新依据） |
 | 旧主库迟到的恢复回报 | 与当前生效主库/代次不符的回报只写入审计观测（`accepted=false`），**不 bump 版本、不改变生效主库**，响应里回传当前真正的主库 |
 | 检查失败（无可接任副本） | 记录一条 `failed_kept_old_primary` 检查及全部淘汰原因，**不产生新代次、不 bump 版本，继续保留上次主库**，值班员修正数据后可重试 |
 | 并发写 | PostgreSQL 下每个写事务先 `SELECT ... FOR UPDATE` 锁定事件行，再做版本/幂等判断 |
@@ -38,15 +41,15 @@ LSN 按 64 位整数处理（`hi/lo` 十六进制），segment 号 = `LSN / 16Mi
 app/
   lsn.py        纯函数：LSN 解析、segment 命名、归档连续性/缺口计算
   failover.py   纯函数：接任资格规则（无数据库依赖，可单测）
-  models.py     SQLAlchemy 模型、引擎与会话
+  models.py     SQLAlchemy 模型、引擎与会话（含旧库补列的轻量升级）
   schemas.py    Pydantic 请求模型
-  service.py    事务服务层：版本控制、幂等、评估落库、接任/回报状态机
+  service.py    事务服务层：版本控制、幂等、共享评估依据、接任/回报状态机
   main.py       FastAPI 路由（JSON API + Jinja2 页面）
   templates/    index.html（事件列表/建单）、incident.html（值班台）
 scripts/
   seed.py             本地样例数据（含 4 种判定结果）
   run_local_demo.sh   一键本地演示（SQLite）
-tests/          25 个测试：纯规则单测 + 服务层状态机 + HTTP 端到端
+tests/          42 个测试：纯规则单测 + 服务层状态机 + 共享评估/并发/旧库升级 + HTTP 端到端
 docker-compose.yml / Dockerfile
 ```
 
@@ -59,7 +62,8 @@ docker compose up --build
 docker compose exec web python -m scripts.seed   # 载入样例事件
 ```
 
-首次启动自动建表（`Base.metadata.create_all`）。
+首次启动自动建表（`Base.metadata.create_all`）；旧版数据库会就地补上
+`check_runs.evaluation_id` 列，历史检查回执仍可读取。
 
 ## 方式二：本地直接运行（无需 Docker，用 SQLite 演示）
 

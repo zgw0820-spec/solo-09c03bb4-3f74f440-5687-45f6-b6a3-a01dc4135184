@@ -13,7 +13,9 @@ import pytest
 
 _tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _tmp.close()
-os.environ["DATABASE_URL"] = f"sqlite:///{_tmp.name}"
+# Respect a DATABASE_URL supplied by the caller so the same suite can run
+# against a real PostgreSQL 16 instance (see README).
+os.environ.setdefault("DATABASE_URL", f"sqlite:///{_tmp.name}")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
